@@ -2,7 +2,7 @@
 TARGET = WavPlayer
 
 # Sources
-CPP_SOURCES = WavPlayer.cpp
+CPP_SOURCES = WavPlayer.cpp SdramWavPlayer.cpp
 
 # Library Locations
 LIBDAISY_DIR = ../../libDaisy

@@ -8,15 +8,21 @@
 #include <stdio.h>
 #include <string.h>
 #include "daisy_pod.h"
+#include "SdramWavPlayer.h"
 //#include "daisy_patch.h"
 
 using namespace daisy;
+using local::SdramWavPlayer;
 
 //DaisyPatch   hw;
 DaisyPod       hw;
 SdmmcHandler   sdcard;
 FatFSInterface fsi;
-WavPlayer      sampler;
+// External SDRAM buffer to avoid clicks per libDaisy issue #535
+#define SDRAM_BUF_SAMPS 4096
+int16_t DSY_SDRAM_BSS g_sdram_buf[SDRAM_BUF_SAMPS];
+
+SdramWavPlayer sampler;
 
 void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
                    AudioHandle::InterleavingOutputBuffer out,
@@ -63,7 +69,7 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
 
     for(size_t i = 0; i < size; i += 2)
     {
-        out[i] = out[i + 1] = s162f(sampler.Stream()) * 0.5f;
+    out[i] = out[i + 1] = s162f(sampler.Stream()) * 0.5f;
     }
 }
 
@@ -80,7 +86,7 @@ int main(void)
     fsi.Init(FatFSInterface::Config::MEDIA_SD);
     f_mount(&fsi.GetSDFileSystem(), "/", 1);
 
-    sampler.Init(fsi.GetSDPath());
+    sampler.Init(fsi.GetSDPath(), g_sdram_buf, SDRAM_BUF_SAMPS);
     sampler.SetLooping(true);
 
     // SET LED to indicate Looping status.
