@@ -51,8 +51,8 @@ void SdramWavPlayer::Init(const char* search_path, int16_t* ext_buffer, size_t b
     Open(0); // Open() seeks to start of data and primes both halves
 
     // Ready to start reading from the beginning (Open() already set these)
-    buff_state_ = BUFFER_STATE_IDLE;
-    read_ptr_   = 0;
+    pending_mask_ = 0;
+    read_ptr_     = 0;
 }
 
 int SdramWavPlayer::Open(size_t sel)
@@ -65,17 +65,59 @@ int SdramWavPlayer::Open(size_t sel)
     FRESULT fr = f_open(&fil_, file_info_[file_sel_].name, (FA_OPEN_EXISTING | FA_READ));
     if(fr == FR_OK)
     {
-    // Seek and prefill both halves so playback switches cleanly
+    // Temporarily mute playback during buffer prefill to avoid mixed old/new data
+    playing_     = false;
+    pending_mask_ = 0;
+
+    // Seek and prefill BOTH halves synchronously
     SeekToData();
-    read_ptr_   = 0;
-    playing_    = true;
-    // Fill first half
-    buff_state_ = BUFFER_STATE_PREPARE_0;
-    Prepare();
-    // Fill second half
-    buff_state_ = BUFFER_STATE_PREPARE_1;
-    Prepare();
-    buff_state_ = BUFFER_STATE_IDLE;
+    read_ptr_ = 0;
+
+    // Fill first half directly
+    {
+        size_t offset    = 0;
+        size_t rx_samps  = buff_len_ / 2;
+        size_t rx_bytes  = rx_samps * sizeof(buff_[0]);
+        size_t bytesread = 0;
+        f_read(&fil_, &buff_[offset], rx_bytes, &bytesread);
+        if(bytesread < rx_bytes || f_eof(&fil_))
+        {
+            if(looping_)
+            {
+                Restart();
+                size_t samp_advance = bytesread / sizeof(buff_[0]);
+                f_read(&fil_, &buff_[offset + samp_advance], rx_bytes - bytesread, &bytesread);
+            }
+            else
+            {
+                playing_ = false;
+            }
+        }
+    }
+    // Fill second half directly
+    {
+        size_t offset    = buff_len_ / 2;
+        size_t rx_samps  = buff_len_ / 2;
+        size_t rx_bytes  = rx_samps * sizeof(buff_[0]);
+        size_t bytesread = 0;
+        f_read(&fil_, &buff_[offset], rx_bytes, &bytesread);
+        if(bytesread < rx_bytes || f_eof(&fil_))
+        {
+            if(looping_)
+            {
+                Restart();
+                size_t samp_advance = bytesread / sizeof(buff_[0]);
+                f_read(&fil_, &buff_[offset + samp_advance], rx_bytes - bytesread, &bytesread);
+            }
+            else
+            {
+                playing_ = false;
+            }
+        }
+    }
+
+    // Resume cleanly from start of new file
+    playing_ = true;
     }
     return fr;
 }
@@ -93,44 +135,72 @@ int16_t SdramWavPlayer::Stream()
         samp = buff_[read_ptr_];
         read_ptr_ = (read_ptr_ + 1) % buff_len_;
         if(read_ptr_ == 0)
-            buff_state_ = BUFFER_STATE_PREPARE_1;
+            pending_mask_ |= 0x2; // queue refill of second half
         else if(read_ptr_ == buff_len_ / 2)
-            buff_state_ = BUFFER_STATE_PREPARE_0;
+            pending_mask_ |= 0x1; // queue refill of first half
     }
     else
     {
-        samp = 0;
-        if(looping_)
-            playing_ = true;
+    // Stay silent when not playing (e.g., during file switch prefill or after EOF without looping)
+    samp = 0;
     }
     return samp;
 }
 
 void SdramWavPlayer::Prepare()
 {
-    if(buff_state_ == BUFFER_STATE_IDLE || !buff_ || buff_len_ == 0)
+    if(!buff_ || buff_len_ == 0)
         return;
 
-    size_t offset    = (buff_state_ == BUFFER_STATE_PREPARE_1) ? (buff_len_ / 2) : 0;
-    size_t rx_samps  = buff_len_ / 2;
-    size_t rx_bytes  = rx_samps * sizeof(buff_[0]);
-    size_t bytesread = 0;
+    // Snapshot pending bits.
+    uint32_t mask = pending_mask_;
+    if(mask == 0)
+        return;
 
-    f_read(&fil_, &buff_[offset], rx_bytes, &bytesread);
-    if(bytesread < rx_bytes || f_eof(&fil_))
+    // Determine which half is currently being consumed by the audio thread.
+    const int current_half = (read_ptr_ < (buff_len_ / 2)) ? 0 : 1;
+    const int other_half   = 1 - current_half;
+
+    // We'll only service the half that is NOT currently being read to avoid
+    // write-while-read races. Defer any request for the current half.
+    bool serviced = false;
+
+    // First, try to service the opposite half if requested.
+    if(((mask >> other_half) & 0x1u) != 0)
     {
-        if(looping_)
+        size_t offset    = (other_half == 1) ? (buff_len_ / 2) : 0;
+        size_t rx_samps  = buff_len_ / 2;
+        size_t rx_bytes  = rx_samps * sizeof(buff_[0]);
+        UINT   bytesread = 0;
+
+        f_read(&fil_, &buff_[offset], rx_bytes, &bytesread);
+        if(bytesread < rx_bytes || f_eof(&fil_))
         {
-            Restart();
-            size_t samp_advance = bytesread / sizeof(buff_[0]);
-            f_read(&fil_, &buff_[offset + samp_advance], rx_bytes - bytesread, &bytesread);
+            if(looping_)
+            {
+                Restart();
+                size_t samp_advance = bytesread / sizeof(buff_[0]);
+                UINT   more_read    = 0;
+                f_read(&fil_, &buff_[offset + samp_advance], rx_bytes - bytesread, &more_read);
+            }
+            else
+            {
+                playing_ = false;
+            }
         }
-        else
-        {
-            playing_ = false;
-        }
+        serviced = true;
+        // Clear the bit we just serviced from pending_mask_.
+        pending_mask_ &= ~(1u << other_half);
     }
-    buff_state_ = BUFFER_STATE_IDLE;
+
+    // If the current half was also requested, defer it by ensuring its bit stays set.
+    if(((mask >> current_half) & 0x1u) != 0)
+    {
+        pending_mask_ |= (1u << current_half);
+    }
+
+    // If nothing was serviced (only the current half was requested), do nothing this round.
+    (void)serviced;
 }
 
 void SdramWavPlayer::Restart()

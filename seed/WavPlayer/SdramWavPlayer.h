@@ -34,17 +34,15 @@ class SdramWavPlayer
     inline size_t GetCurrentFile() const { return file_sel_; }
 
   private:
-    enum BufferState
-    {
-        BUFFER_STATE_IDLE,
-        BUFFER_STATE_PREPARE_0,
-        BUFFER_STATE_PREPARE_1,
-    };
+  // Bitmask queue of pending half-buffer refills set by audio thread and
+  // consumed by the main thread. bit0 -> first half, bit1 -> second half.
+  // Using a mask prevents lost requests when both halves queue up around
+  // loop boundaries.
+  volatile uint32_t pending_mask_ = 0;
 
     static constexpr size_t kMaxFiles = 8;
     WavFileInfo             file_info_[kMaxFiles];
     size_t                  file_cnt_ = 0, file_sel_ = 0;
-    BufferState             buff_state_ = BUFFER_STATE_IDLE;
     int16_t*                buff_       = nullptr;
     size_t                  buff_len_   = 0; // in samples
     size_t                  read_ptr_   = 0;

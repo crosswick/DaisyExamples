@@ -23,6 +23,8 @@ FatFSInterface fsi;
 int16_t DSY_SDRAM_BSS g_sdram_buf[SDRAM_BUF_SAMPS];
 
 SdramWavPlayer sampler;
+// Defer file switching out of audio callback
+static volatile int g_pending_file = -1; // -1 means no request
 
 void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
                    AudioHandle::InterleavingOutputBuffer out,
@@ -33,25 +35,18 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
     // Debounce digital controls
     hw.ProcessDigitalControls();
 
-    // Change file with encoder.
+    // Change file with encoder (request handled in main loop)
     inc = hw.encoder.Increment();
-    if(inc > 0)
+    if(inc != 0)
     {
-        size_t curfile;
-        curfile = sampler.GetCurrentFile();
-        if(curfile < sampler.GetNumberFiles() - 1)
-        {
-            sampler.Open(curfile + 1);
-        }
-    }
-    else if(inc < 0)
-    {
-        size_t curfile;
-        curfile = sampler.GetCurrentFile();
-        if(curfile > 0)
-        {
-            sampler.Open(curfile - 1);
-        }
+        size_t curfile = sampler.GetCurrentFile();
+        size_t count   = sampler.GetNumberFiles();
+        size_t next    = curfile;
+        if(inc > 0 && curfile < count - 1)
+            next = curfile + 1;
+        else if(inc < 0 && curfile > 0)
+            next = curfile - 1;
+        g_pending_file = static_cast<int>(next);
     }
 
     //    if(hw.button1.RisingEdge())
@@ -98,6 +93,12 @@ int main(void)
     // Loop forever...
     for(;;)
     {
+        // Handle any pending file switch outside audio thread
+        if(g_pending_file >= 0)
+        {
+            sampler.Open(static_cast<size_t>(g_pending_file));
+            g_pending_file = -1;
+        }
         // Prepare buffers for sampler as needed
         sampler.Prepare();
     }
